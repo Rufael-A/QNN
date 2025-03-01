@@ -1,0 +1,189 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from qiskit import QuantumCircuit, transpile
+from qiskit.circuit import Parameter
+from qiskit.visualization import plot_histogram
+from qiskit_aer import Aer
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+class QuantumNeuralNetwork:
+    def __init__(self, num_qubits=2):
+        self.num_qubits = num_qubits
+        self.circuit, self.params = self._create_circuit()
+        self.simulator = Aer.get_backend('aer_simulator')
+        self.transpiled_circuit = transpile(self.circuit, self.simulator)
+        self.parameter_history = []
+        self.cost_history = []
+        
+    def _create_circuit(self):
+        """Create parameterized quantum circuit with input encoding"""
+        circuit = QuantumCircuit(self.num_qubits)
+        params = [Parameter(f'θ{i}') for i in range(4 * self.num_qubits)]  # More parameters
+        
+        # Input encoding layer
+        for i in range(self.num_qubits):
+            circuit.rx(params[i], i)  # Encode input features
+            circuit.ry(params[i + self.num_qubits], i)  # Trainable parameters
+        
+        # Entanglement layer
+        for i in range(self.num_qubits-1):
+            circuit.cx(i, (i+1) % self.num_qubits)
+        
+        # Additional parameterized layers
+        for i in range(self.num_qubits):
+            circuit.rx(params[i + 2 * self.num_qubits], i)
+            circuit.ry(params[i + 3 * self.num_qubits], i)
+        
+        circuit.measure_all()
+        return circuit, params
+    
+    def compute_loss(self, counts, true_label):
+        """Calculate mean squared error (MSE) loss for classification"""
+        target_state = '00' if true_label == 0 else '11'  # Define class states
+        p_target = counts.get(target_state, 0) / self.shots
+        return (1 - p_target) ** 2  # MSE loss
+    
+    def train(self, iterations=200, learning_rate=0.05, shots=1024, epsilon=0.05):
+        """Training loop with real classification task"""
+        self.shots = shots
+        
+        # Generate synthetic dataset (inputs and labels)
+        X_train = np.random.rand(200, self.num_qubits) * np.pi  # Larger dataset
+        y_train = (np.sum(X_train, axis=1) > (np.pi)).astype(int)  # Adjusted classification rule
+        
+        theta = np.random.uniform(0, 2*np.pi, size=4*self.num_qubits)  # More parameters
+        
+        for epoch in range(iterations):
+            total_loss = 0
+            gradient = np.zeros_like(theta)
+            
+            for x, y in zip(X_train, y_train):
+                # Encode input features into the circuit
+                param_values = np.concatenate([x, theta[self.num_qubits:]])
+                param_dict = {p: param_values[i] for i, p in enumerate(self.params)}
+                
+                # Forward pass
+                bound_qc = self.transpiled_circuit.assign_parameters(param_dict)
+                result = self.simulator.run(bound_qc, shots=shots).result()
+                counts = result.get_counts()
+                loss = self.compute_loss(counts, y)
+                total_loss += loss
+                
+                # Gradient calculation
+                grad_i = np.zeros_like(theta)
+                for i in range(len(theta)):
+                    theta_plus = theta.copy()
+                    theta_plus[i] += epsilon
+                    param_values_plus = np.concatenate([x, theta_plus[self.num_qubits:]])
+                    result_plus = self.simulator.run(
+                        self.transpiled_circuit.assign_parameters(
+                            {p: param_values_plus[j] for j, p in enumerate(self.params)}
+                        ), shots=shots
+                    ).result()
+                    loss_plus = self.compute_loss(result_plus.get_counts(), y)
+                    
+                    theta_minus = theta.copy()
+                    theta_minus[i] -= epsilon
+                    param_values_minus = np.concatenate([x, theta_minus[self.num_qubits:]])
+                    result_minus = self.simulator.run(
+                        self.transpiled_circuit.assign_parameters(
+                            {p: param_values_minus[j] for j, p in enumerate(self.params)}
+                        ), shots=shots
+                    ).result()
+                    loss_minus = self.compute_loss(result_minus.get_counts(), y)
+                    
+                    grad_i[i] = (loss_plus - loss_minus) / (2 * epsilon)
+                
+                gradient += grad_i
+            
+            # Update parameters
+            theta -= learning_rate * gradient / len(X_train)
+            avg_loss = total_loss / len(X_train)
+            self.cost_history.append(avg_loss)
+            self.parameter_history.append(theta.copy())
+            
+            print(f"Epoch {epoch+1}/{iterations} - Loss: {avg_loss:.4f}")
+
+        self.final_parameters = theta
+        self._visualize_training()
+        
+    def _visualize_training(self):
+        """Visualize training progress"""
+        plt.figure(figsize=(15, 5))
+        
+        # Cost history
+        plt.subplot(1, 2, 1)
+        plt.plot(self.cost_history, 'b', lw=2)
+        plt.title('Training Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Cost')
+        plt.grid(True)
+        
+        # Parameter evolution
+        plt.subplot(1, 2, 2)
+        params = np.array(self.parameter_history).T
+        for i, param in enumerate(params):
+            plt.plot(param, label=f'θ{i}')
+        plt.title('Parameter Evolution')
+        plt.xlabel('Epoch')
+        plt.ylabel('Parameter Value')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig('qnn_training.png')
+        plt.show()
+        
+    def analyze_circuit(self, shots=1000):
+        """Evaluate on test set with meaningful metrics"""
+        # Generate test data
+        X_test = np.random.rand(100, self.num_qubits) * np.pi
+        y_test = (np.sum(X_test, axis=1) > (np.pi)).astype(int)
+        
+        true_labels = []
+        predicted_labels = []
+        
+        for x, y in zip(X_test, y_test):
+            param_values = np.concatenate([x, self.final_parameters[self.num_qubits:]])
+            param_dict = {p: param_values[i] for i, p in enumerate(self.params)}
+            bound_qc = self.transpiled_circuit.assign_parameters(param_dict)
+            result = self.simulator.run(bound_qc, shots=shots).result()
+            counts = result.get_counts()
+            
+            # Predict class based on state probabilities
+            prob_class0 = counts.get('00', 0) / shots
+            prob_class1 = counts.get('11', 0) / shots
+            prediction = 0 if prob_class0 > prob_class1 else 1
+            
+            true_labels.append(y)
+            predicted_labels.append(prediction)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(true_labels, predicted_labels)
+        precision = precision_score(true_labels, predicted_labels)
+        recall = recall_score(true_labels, predicted_labels)
+        f1 = f1_score(true_labels, predicted_labels)
+        
+        print("\nRefined Classification Metrics:")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1-Score: {f1:.4f}")
+        
+        # Plot confusion matrix
+        from sklearn.metrics import ConfusionMatrixDisplay
+        ConfusionMatrixDisplay.from_predictions(true_labels, predicted_labels)
+        plt.title("Confusion Matrix")
+        plt.show()
+
+if __name__ == "__main__":
+    qnn = QuantumNeuralNetwork(num_qubits=2)
+    qnn.train(iterations=200, learning_rate=0.05, shots=1024)
+    qnn.analyze_circuit()
+
+    np.save('trained_parameters.npy', qnn.final_parameters)
+    print("Trained parameters saved to 'trained_parameters.npy'")
+    
+    print("\nTrained Parameters:")
+    for i, param in enumerate(qnn.final_parameters):
+        print(f"θ{i}: {param:.4f}")
